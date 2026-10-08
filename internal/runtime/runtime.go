@@ -47,10 +47,11 @@ func New(cfg Config) *Runtime {
 	}
 
 	// 固件安装器：设备“收到” ota/<version>/<deviceID> 主题后实际执行的安装动作。
+	// 全局在装并发使用 firmware.DefaultGlobalConcurrent（可按需在此收敛）。
 	fm := firmware.NewManager(func(ctx context.Context, deviceID, fromVer, toVer string) error {
 		time.Sleep(5 * time.Millisecond) // 模拟安装耗时
 		return nil
-	})
+	}, firmware.WithGlobalConcurrent(firmware.DefaultGlobalConcurrent))
 	for dev, ver := range cfg.InitialVersions {
 		fm.SetCurrentVersion(dev, ver)
 	}
@@ -115,7 +116,11 @@ func splitTopic(raw string) []string {
 }
 
 // SetLogger 注入日志函数。
-func (r *Runtime) SetLogger(f func(format string, args ...any)) { r.logf = f }
+func (r *Runtime) SetLogger(f func(format string, args ...any)) {
+	r.logf = f
+	// 让固件并行发布的治理判定（容量兜底、就绪/降级/接管保护）也走同一条日志。
+	r.Firmware.SetLogger(f)
+}
 
 func (r *Runtime) log(format string, args ...any) {
 	r.logf(format, args...)
