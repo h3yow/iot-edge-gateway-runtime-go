@@ -92,6 +92,37 @@ func main() {
 	})
 	logger.Printf("发布 fw-2.0 => status=%s reason=%s err=%v", rel.Status, rel.Reason, err)
 
+	logger.Println("=== 阶段4b：两个团队并行发布（容量参数 0 兜底、低版本被裁决拒绝） ===")
+	var pwg sync.WaitGroup
+	pwg.Add(2)
+	go func() { // 团队甲：给 dev-A/dev-B 发 fw-2.1，并发参数故意填 0 触发安全兜底
+		defer pwg.Done()
+		r, e := rt.PublishFirmware(context.Background(), firmware.Config{
+			Version: "fw-2.1", MaxConcurrency: 0, FailureThreshold: -1,
+			Batches: []firmware.Batch{{Name: "all", DeviceIDs: []string{"dev-A", "dev-B"}}},
+		})
+		logger.Printf("并行发布 fw-2.1 [dev-A,dev-B] => status=%s reason=%s err=%v", r.Status, r.Reason, e)
+	}()
+	go func() { // 团队乙：给 dev-C/dev-D 发 fw-2.2，设备集合不相交可同时进行
+		defer pwg.Done()
+		r, e := rt.PublishFirmware(context.Background(), firmware.Config{
+			Version: "fw-2.2", MaxConcurrency: 0,
+			Batches: []firmware.Batch{{Name: "all", DeviceIDs: []string{"dev-C", "dev-D"}}},
+		})
+		logger.Printf("并行发布 fw-2.2 [dev-C,dev-D] => status=%s reason=%s err=%v", r.Status, r.Reason, e)
+	}()
+	pwg.Wait()
+	// 低版本 fw-1.9 试图下发给已在 fw-2.1 的 dev-A：整单被版本裁决拒绝。
+	if _, e := rt.PublishFirmware(context.Background(), firmware.Config{
+		Version: "fw-1.9", MaxConcurrency: 2,
+		Batches: []firmware.Batch{{Name: "all", DeviceIDs: []string{"dev-A"}}},
+	}); e != nil {
+		logger.Printf("低版本 fw-1.9 下发 dev-A 被拒 => err=%v（设备保持 %s）", e, rt.Firmware.CurrentVersion("dev-A"))
+	}
+	logger.Printf("并行治理后设备版本 A=%s B=%s C=%s D=%s",
+		rt.Firmware.CurrentVersion("dev-A"), rt.Firmware.CurrentVersion("dev-B"),
+		rt.Firmware.CurrentVersion("dev-C"), rt.Firmware.CurrentVersion("dev-D"))
+
 	logger.Println("=== 阶段5：演示非法/越权主题被拒（原因可区分） ===")
 	// 通过 broker 直接展示拒绝原因
 	rt.DemoRejections()

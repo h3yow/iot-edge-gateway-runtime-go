@@ -110,16 +110,33 @@ type Manager struct {
 	install InstallFunc
 	rel     map[string]*releaseInfo
 	current map[string]string // deviceID -> 当前安装版本
+	// 发布治理：全局安装容量（跨所有并行发布单）与关键判定日志。
+	globalSem      chan struct{}
+	globalInflight atomic.Int32
+	logf           func(format string, args ...any)
 }
 
-// NewManager 创建发布管理器。
-func NewManager(install InstallFunc) *Manager {
+// NewManager 创建发布管理器（全局并发取默认安全值 DefaultGlobalMaxConcurrency）。
+func NewManager(install InstallFunc, opts ...ManagerOption) *Manager {
+	o := managerOptions{globalMaxConcurrency: DefaultGlobalMaxConcurrency}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	g := normalizeConcurrency(o.globalMaxConcurrency, DefaultGlobalMaxConcurrency)
+	logf := o.logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	return &Manager{
-		install: install,
-		rel:     make(map[string]*releaseInfo),
-		current: make(map[string]string),
+		install:   install,
+		rel:       make(map[string]*releaseInfo),
+		current:   make(map[string]string),
+		globalSem: make(chan struct{}, g),
+		logf:      logf,
 	}
 }
+
+func (m *Manager) log(format string, args ...any) { m.logf(format, args...) }
 
 // SetCurrentVersion 预置/登记设备当前运行的固件版本（设备注册时使用）。
 func (m *Manager) SetCurrentVersion(deviceID, version string) {
@@ -146,10 +163,59 @@ func (m *Manager) Publish(ctx context.Context, cfg Config) (*Release, error) {
 	if err := validate(cfg); err != nil {
 		return nil, err
 	}
+	// 容量参数兜底：未填/0/负数统一归一化为安全值，避免负容量 panic 或无界并发。
+	cfg.MaxConcurrency = normalizeConcurrency(cfg.MaxConcurrency, DefaultPerReleaseConcurrency)
+	cfg.FailureThreshold = normalizeConcurrency(cfg.FailureThreshold, 1)
 	m.mu.Lock()
 	if _, exists := m.rel[cfg.Version]; exists {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAlreadyPublished, cfg.Version)
+	}
+	// 准入裁决 1：任何目标设备当前已在严格更高的已发布版本上 -> 整单拒绝，
+	// 低版本发布不允许顶掉高版本（已就绪的同版本设备不受影响，下面按 ready 处理）。
+	targetDevices := make(map[string]bool)
+	for _, b := range cfg.Batches {
+		for _, id := range b.DeviceIDs {
+			targetDevices[id] = true
+		}
+	}
+	for id := range targetDevices {
+		cur := m.current[id]
+		if CompareVersions(cur, cfg.Version) > 0 {
+			m.mu.Unlock()
+			m.log("低版本发布被拒 version=%s device=%s current=%s => %v",
+				cfg.Version, id, cur, ErrLowerVersionRejected)
+			return nil, fmt.Errorf("%w: device %s on %s, target %s",
+				ErrLowerVersionRejected, id, cur, cfg.Version)
+		}
+	}
+	// 准入裁决 2：高版本发布自动接管仍在进行中的低版本发布单（设备集合有交集即可）。
+	for _, other := range m.rel {
+		if other.cfg.Version == cfg.Version || CompareVersions(other.cfg.Version, cfg.Version) >= 0 {
+			continue
+		}
+		other.mu.Lock()
+		active := !isTerminal(other.status)
+		overlaps := false
+		if active {
+			for id := range other.devices {
+				if targetDevices[id] {
+					overlaps = true
+					break
+				}
+			}
+		}
+		if overlaps {
+			other.stop.Store(true)
+			other.stopReason = "superseded"
+			other.status = StatusRollingBack
+			other.reason = "superseded_by:" + cfg.Version
+		}
+		other.mu.Unlock()
+		if overlaps {
+			m.log("高版本接管 old=%s new=%s => 旧发布停止，回滚时设备若已在 %s 则保持",
+				other.cfg.Version, cfg.Version, cfg.Version)
+		}
 	}
 	// 记录每个设备进入本次发布前的版本，用于幂等与回滚。
 	devs := make(map[string]*installRecord)
@@ -158,8 +224,13 @@ func (m *Manager) Publish(ctx context.Context, cfg Config) (*Release, error) {
 			if _, dup := devs[id]; dup {
 				continue
 			}
+			state := DevPending
+			if m.current[id] == cfg.Version {
+				// 设备已是目标版本：已就绪，无需安装。
+				state = DevReady
+			}
 			devs[id] = &installRecord{
-				state:     DevPending,
+				state:     state,
 				fromVer:   m.current[id],
 				targetVer: cfg.Version,
 			}
@@ -175,10 +246,9 @@ func (m *Manager) Publish(ctx context.Context, cfg Config) (*Release, error) {
 	m.mu.Unlock()
 
 	threshold := cfg.FailureThreshold
-	if threshold <= 0 {
-		threshold = 1
-	}
 	sem := make(chan struct{}, cfg.MaxConcurrency)
+	m.log("发布受理 version=%s 设备数=%d 批次数=%d 单发布并发=%d 失败阈值=%d",
+		cfg.Version, len(devs), len(cfg.Batches), cfg.MaxConcurrency, threshold)
 
 	// ctx 取消 -> 协作式停止
 	watchDone := make(chan struct{})
@@ -193,22 +263,30 @@ func (m *Manager) Publish(ctx context.Context, cfg Config) (*Release, error) {
 
 	var batchErr error
 batchLoop:
-	for bi, batch := range cfg.Batches {
+	for _, batch := range cfg.Batches {
 		var wg sync.WaitGroup
-		var failCnt atomic.Int32
+		var failCnt, rejectCnt atomic.Int32
 		for _, id := range batch.DeviceIDs {
 			if info.stop.Load() {
 				break
 			}
 			rec := info.devices[id]
+			// 准入时已就绪的设备无需安装，直接跳过（不占并发名额）。
+			if rec.snapshotState() == DevReady {
+				continue
+			}
 			wg.Add(1)
 			sem <- struct{}{}
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
 				m.doInstall(ctx, info, id, rec)
-				if rec.state == DevFailed {
+				switch rec.snapshotState() {
+				case DevFailed:
 					failCnt.Add(1)
+				case DevRejected:
+					failCnt.Add(1)
+					rejectCnt.Add(1)
 				}
 			}()
 		}
@@ -224,11 +302,15 @@ batchLoop:
 			break batchLoop
 		}
 		if int(failCnt.Load()) >= threshold {
-			info.setStopReason("failure_threshold")
-			batchErr = fmt.Errorf("firmware: batch %q failures %d >= threshold %d", batch.Name, failCnt.Load(), threshold)
+			if rejectCnt.Load() > 0 {
+				info.setStopReason("version_rejected")
+				batchErr = fmt.Errorf("firmware: batch %q rejected: %d devices already on higher version", batch.Name, rejectCnt.Load())
+			} else {
+				info.setStopReason("failure_threshold")
+				batchErr = fmt.Errorf("firmware: batch %q failures %d >= threshold %d", batch.Name, failCnt.Load(), threshold)
+			}
 			break batchLoop
 		}
-		_ = bi
 	}
 	close(watchDone)
 
@@ -250,6 +332,11 @@ batchLoop:
 		m.rollback(info)
 	}
 
+	// 终态一致性兜底：不允许发布单完成后仍有设备挂在 pending/installing。
+	m.reconcileTerminal(info)
+	m.log("发布收敛 version=%s => status=%s reason=%s failures=%d 回滚错误=%d",
+		cfg.Version, terminal, outReason, info.failures, len(info.rbErrs))
+
 	info.mu.Lock()
 	info.status = terminal
 	info.reason = outReason
@@ -261,25 +348,49 @@ batchLoop:
 // doInstall 完成单设备安装，内置同版本幂等与状态流转。调用方无需持 info 锁。
 func (m *Manager) doInstall(ctx context.Context, info *releaseInfo, deviceID string, rec *installRecord) {
 	rec.mu.Lock()
-	// 幂等：设备当前已是目标版本且记录为 installed，直接跳过。
-	if rec.state == DevInstalled || rec.fromVer == rec.targetVer {
+	// 幂等：设备记录已为 installed，直接跳过。
+	if rec.state == DevInstalled {
 		rec.mu.Unlock()
 		return
 	}
-	rec.state = DevInstalling
-	rec.attempts++
 	rec.mu.Unlock()
 
 	m.mu.Lock()
 	cur := m.current[deviceID]
 	m.mu.Unlock()
 	if cur == rec.targetVer {
-		// 另一条路径已装好：幂等跳过
+		// 设备当前已是目标版本：按“已就绪、无需安装”处理，不占安装名额。
 		rec.mu.Lock()
-		rec.state = DevInstalled
+		rec.state = DevReady
+		rec.mu.Unlock()
+		m.log("设备已就绪 device=%s version=%s => 无需安装", deviceID, rec.targetVer)
+		return
+	}
+
+	// 版本裁决：只能向前，不能把设备从更高的已发布版本拽回旧版本。
+	if CompareVersions(cur, rec.targetVer) > 0 {
+		rec.mu.Lock()
+		rec.state = DevRejected
+		rec.lastError = fmt.Sprintf("governance: current %s higher than target %s", cur, rec.targetVer)
+		rec.mu.Unlock()
+		m.log("低版本下发被拒 device=%s current=%s target=%s => 保持高版本", deviceID, cur, rec.targetVer)
+		return
+	}
+
+	rec.mu.Lock()
+	rec.state = DevInstalling
+	rec.attempts++
+	rec.mu.Unlock()
+
+	// 真正开始安装前占用全局名额，保证跨并行发布单的安装总数不被顶穿。
+	if err := m.acquireGlobalSlot(ctx); err != nil {
+		rec.mu.Lock()
+		rec.state = DevFailed
+		rec.lastError = err.Error()
 		rec.mu.Unlock()
 		return
 	}
+	defer m.releaseGlobalSlot()
 
 	from := cur
 	if from == "" {
@@ -295,18 +406,26 @@ func (m *Manager) doInstall(ctx context.Context, info *releaseInfo, deviceID str
 	}
 	rec.state = DevInstalled
 	m.mu.Lock()
-	m.current[deviceID] = rec.targetVer
+	// 双检：安装函数返回后若设备已被其他路径更新到更高版本，不覆盖。
+	if CompareVersions(m.current[deviceID], rec.targetVer) > 0 {
+		rec.state = DevKept
+	} else {
+		m.current[deviceID] = rec.targetVer
+	}
 	m.mu.Unlock()
 }
 
-// rollback 将本次发布中已安装设备回滚到发布前版本。
+// rollback 将本次发布中已安装、且当前仍停留在本发布目标版本上的设备回滚到发布前版本。
+// 关键裁决：若设备当前已经在更高的已发布版本上（被更高版本接管），则保持现状，
+// 状态记 kept，绝不执行旧版本回滚安装。
 func (m *Manager) rollback(info *releaseInfo) {
 	info.mu.Lock()
 	info.status = StatusRollingBack
+	cfg := info.cfg
 	info.mu.Unlock()
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, max(1, info.cfg.MaxConcurrency))
+	sem := make(chan struct{}, normalizeConcurrency(cfg.MaxConcurrency, DefaultPerReleaseConcurrency))
 	for id, rec := range info.devices {
 		rec.mu.Lock()
 		installed := rec.state == DevInstalled
@@ -320,11 +439,36 @@ func (m *Manager) rollback(info *releaseInfo) {
 			rec.mu.Unlock()
 			continue
 		}
+
+		m.mu.Lock()
+		cur := m.current[id]
+		m.mu.Unlock()
+		// 版本裁决：设备已不在本发布目标版本上（通常已被更高版本接管），
+		// 不做任何可能降级的安装，保持当前已发布版本。
+		if cur != rec.targetVer {
+			rec.mu.Lock()
+			rec.state = DevKept
+			rec.mu.Unlock()
+			m.log("回滚被版本裁决拦住 device=%s current=%s 目标版本=%s 发布前=%s => 保持 current",
+				id, cur, rec.targetVer, rec.fromVer)
+			continue
+		}
+
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// 回滚安装同样占用全局名额，避免多个发布单同时回滚顶穿容量。
+			if err := m.acquireGlobalSlot(context.Background()); err != nil {
+				rec.mu.Lock()
+				rec.state = DevFailed
+				rec.lastError = "rollback: " + err.Error()
+				rec.mu.Unlock()
+				return
+			}
+			defer m.releaseGlobalSlot()
+
 			rberr := m.install(context.Background(), id, rec.targetVer, rec.fromVer)
 			rec.mu.Lock()
 			defer rec.mu.Unlock()
@@ -372,8 +516,11 @@ func (m *Manager) Offer(version, deviceID string) (DeviceStatus, error) {
 	rec.mu.Lock()
 	state := rec.state
 	rec.mu.Unlock()
-	if state == DevInstalled {
+	switch state {
+	case DevInstalled:
 		return DevInstalled, nil // 幂等：已安装
+	case DevReady:
+		return DevReady, nil // 已就绪：当前版本即目标版本，无需安装
 	}
 	m.doInstall(context.Background(), info, deviceID, rec)
 	rec.mu.Lock()
@@ -401,7 +548,13 @@ func (m *Manager) Cancel(version string) error {
 }
 
 // Supersede 将旧版本发布单标记为被更高版本取代并停止、回滚。
+// 版本裁决：newVersion 必须严格高于 oldVersion，否则拒绝，
+// 避免低版本借“接管”名义顶掉高版本。
 func (m *Manager) Supersede(oldVersion, newVersion string) error {
+	if CompareVersions(newVersion, oldVersion) <= 0 {
+		m.log("接管被版本裁决拒绝 old=%s new=%s => %v", oldVersion, newVersion, ErrInvalidVersionOrder)
+		return fmt.Errorf("%w: %s is not higher than %s", ErrInvalidVersionOrder, newVersion, oldVersion)
+	}
 	m.mu.Lock()
 	info := m.rel[oldVersion]
 	m.mu.Unlock()
@@ -476,9 +629,6 @@ func validate(cfg Config) error {
 	}
 	if len(cfg.Batches) == 0 {
 		return ErrNoBatches
-	}
-	if cfg.MaxConcurrency <= 0 {
-		cfg.MaxConcurrency = 1
 	}
 	return nil
 }

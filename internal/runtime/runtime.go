@@ -47,10 +47,16 @@ func New(cfg Config) *Runtime {
 	}
 
 	// 固件安装器：设备“收到” ota/<version>/<deviceID> 主题后实际执行的安装动作。
+	// 全局同时安装设备数取固件包默认安全上限（firmware.DefaultGlobalMaxConcurrency）。
+	var fwLog func(string, ...any)
 	fm := firmware.NewManager(func(ctx context.Context, deviceID, fromVer, toVer string) error {
 		time.Sleep(5 * time.Millisecond) // 模拟安装耗时
 		return nil
-	})
+	}, firmware.WithLogger(func(format string, args ...any) {
+		if fwLog != nil {
+			fwLog(format, args...)
+		}
+	}))
 	for dev, ver := range cfg.InitialVersions {
 		fm.SetCurrentVersion(dev, ver)
 	}
@@ -65,6 +71,7 @@ func New(cfg Config) *Runtime {
 		needsFlush: make(map[string]bool),
 		logf:       func(string, ...any) {},
 	}
+	fwLog = r.log
 
 	// 每个设备：注册授权 -> 连接 -> 订阅命令与 OTA 主题。
 	for _, dev := range cfg.DeviceIDs {

@@ -57,6 +57,13 @@ func (f *fakeInstaller) callCount(devVer string) int {
 	return f.installed[devVer]
 }
 
+// snapshotCalls 返回全部安装调用轨迹（含回滚调用），用于断言不存在降级安装。
+func (f *fakeInstaller) snapshotCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
 func canaryConfig(ver string, devices ...string) Config {
 	return Config{
 		Version: ver,
